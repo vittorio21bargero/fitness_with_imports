@@ -3,93 +3,253 @@
 
 # In[ ]:
 
+import numpy as np
 import pandas as pd
+import os
+import re
+import zipfile
+from pathlib import Path
 
 
-def process_BACI_raw_folder(input_folder: str, output_path: str):
+
+#  1) BACI / Mcp processing
+
+# 1.0) cartella zip (CEPII) ---> BACI (import + export) per ogni anno
+
+def process_BACI_raw_folder(input_zip: str, output_folder: str):
     """
-    Input: 
-    - Prende una cartella (input_folder)
-    - Va a vedere i file BACI csv all' interno della cartella che hanno le seguenti colonne:
-
-    t: year
-    i: exporter
-    j: importer
-    k: product
-    v: value
-
-    
+    Input:
+    - input_zip: percorso del file .zip contenente i csv BACI (colonne t, i, j, k, v)
+    - output_folder: cartella dove salvare i parquet
 
     Output:
-    - Crea un UNICO file parquet con i dati aggregati annuali di export/import per prodotto per ogni nazione
-    - Il file viene salvato nel percorso output_path
-
-    t: year
-    i/j: exporter / importer
-    k: product
-    v: value
+    - Per ogni csv dentro lo zip crea DUE parquet:
+        * BACI_export_Y<anno>.parquet  -> aggregato per esportatore (i)
+        * BACI_import_Y<anno>.parquet  -> aggregato per importatore (j)
+    
     
     """
-    
-    all_dfs = []  # lista (vettore) con all' interno i vari dataframes che sono presenti nella cartella
-    
-    for filename in os.listdir(input_folder):
-        # restituisce tutti i file csv della cartella input_folder
-        if filename.endswith(".csv"):
-            filepath = os.path.join(input_folder, filename)
-            # ricostruisce il percorso completo del file: mi serve perchè devo ricostruirmi ancora il percorso completo
-            
-            # Legge i file selezionati sopra
-            df = pd.read_csv(filepath)
-            
-            # Estrai anno dal nome file, es: "BACI_HS92_Y2024_V202601.csv"
+    os.makedirs(output_folder, exist_ok=True)
+
+    with zipfile.ZipFile(input_zip, 'r') as z:
+        for filename in z.namelist():
+            if not filename.endswith(".csv"):
+                continue
+
+            # legge il csv direttamente dallo zip, senza estrarlo, inoltre converto subiot la colonna dei prodotti in formato stringa
+            with z.open(filename) as f:
+                df = df = pd.read_csv(f, encoding='utf-8-sig', dtype={'k': str})
+
+            # estrai anno dal nome file, es: "BACI_HS92_Y2024_V202601.csv"
             match = re.search(r'Y(\d{4})', filename)
-            # va a controllare su tutti i file se è presente una Y seguita da 4 cifre
-            # non è booleana ma si comporta in modo simile: 
-            # se trova un oggetto nell'if corrisponde a un true al contrario a un false
             if match:
                 year = int(match.group(1))
-                # restituisce la parte dentro la parentesi all'interno di re.search
             else:
                 print(f"Anno non trovato in {filename}, salto file")
                 continue
-            
-            # Aggiungi colonna anno
+
             df['t'] = year
-            
-            
-            # Aggrega (i/j, k, t) e somma v
-            df_agg = (
-                df_clean
-                .groupby(['j', 'k', 't'], as_index=False)['v']
-                .sum()
+
+            # estrai nomenclatura dal nome file, es: "HS17", "HS92"
+            match_hs = re.search(r'(HS\d{2})', filename)
+            nomenclature = match_hs.group(1) if match_hs else "HSNA"
+
+            # --- aggregazione EXPORT: per esportatore (i) ---
+            df_export = (
+                df.groupby(['i', 'k', 't'], as_index=False)['v']
+                  .sum()
+                  .rename(columns={'i': 'country'})
             )
-            
-            all_dfs.append(df_agg)
+            export_path = os.path.join(output_folder, f"BACI_export_{nomenclature}_Y{year}.parquet")
+            df_export.to_parquet(export_path, index=False)
+
+            # --- aggregazione IMPORT: per importatore (j) ---
+            df_import = (
+                df.groupby(['j', 'k', 't'], as_index=False)['v']
+                  .sum()
+                  .rename(columns={'j': 'country'})
+            )
+            import_path = os.path.join(output_folder, f"BACI_import_{nomenclature}_Y{year}.parquet")
+            df_import.to_parquet(import_path, index=False)
+
+            print(f"{os.path.basename(filename)}: salvati export e import per anno {year}")
+
+
+# 1.1.a) BACI HS6 to BACI HS4 (singolo file parquet)
+
+def BACI_HS6_to_HS4(BACI_HS6: pd.DataFrame):
+    """
+    Converte un DataFrame BACI da HS6 a HS4 (prime 4 cifre del codice k).
+
+    Input:
+    - BACI_HS6: dataframe BACI HS6 (export o import)
+
+    Output:
+    -BACI_HS4: dataframe BACI HS6 (export o import)
     
-    # Unisci tutti i DataFrame
-    final_df = pd.concat(all_dfs, ignore_index=True)
+    """
     
-    # Salva in parquet
-    final_df.to_parquet(output_path, index=False)
+    df_HS6 = BACI_HS6.copy()
+    # individua automaticamente la colonna del paese ('country', 'i' o 'j')
+    country_col = next(c for c in ['country', 'i', 'j'] if c in df.columns)
+    # prime 4 cifre del codice prodotto (zfill per non perdere gli zeri iniziali)
+    df_HS4['k'] = df_HS6['k'].astype(str).str.zfill(6).str[:4]
+    # riaggrega sommando v
+    df_HS4 = df.groupby([country_col, 't', 'k'], as_index=False)['v'].sum()
+    BACI_HS4 = df_HS4
+    
+    return BACI_HS4
+
+
+
+
+
+# 1.1.b) BACI HS6 to BACI HS4 (intera cartella)
+
+def process_BACI_HS6_folder_to_HS4(input_folder: str, output_folder: str):
+    """
+    Input:
+    - input_folder: cartella con i parquet BACI a 6 digit
+    - output_folder: cartella dove salvare i parquet BACI a 4 digit
+    
+    """
+    os.makedirs(output_folder, exist_ok=True)
+
+    for filename in os.listdir(input_folder):
+        if not filename.endswith(".parquet"):
+            continue
+
+        in_path = os.path.join(input_folder, filename)
+        df = pd.read_parquet(in_path)
+
+        df_hs4 = BACI_HS6_to_HS4(df)
+
+        out_path = os.path.join(output_folder, filename)
+        df_hs4.to_parquet(out_path, index=False)
+        print(f"{filename}: convertito HS6 -> HS4")
+
+
+
+
+# 1.2.a) BACI  ---> Mcp binarizzato (singolo file)
+
+def build_Mcp_from_BACI(
+    BACI_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Input:
+    - df: dataframe BACI relativo a UN SOLO anno, con export/import per prodotto per ogni nazione 
+
+    Output:
+    - Matrice Mcp (country x product), valori 0/1
+    
+    """
+    df = BACI_df.copy()
+
+    country_tot = df.groupby('country')['v'].transform('sum')
+    product_tot = df.groupby('k')['v'].transform('sum')
+    total = df['v'].sum()
+
+    df['RCA'] = (df['v'] / country_tot) / (product_tot / total)
+    df['Mcp'] = (df['RCA'] >= 1).astype(int)
+
+    matrix = df.pivot_table(
+        index= 'country',
+        columns= 'k',
+        values='Mcp',
+        fill_value=0
+    ).astype(int)
+    return matrix
+
+
+
+# 1.2.b) BACI  ---> Mcp binarizzato (singolo file)
+
+def build_Mcp_non_binarized_from_BACI(
+    BACI_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Input:
+    - BACI_df: dataframe BACI relativo a UN SOLO anno, con export/import per prodotto per ogni nazione 
+
+    Output:
+    - Matrice Mcp (country x product), valori reali
+    
+    """
+    df = BACI_df.copy()
+
+    country_tot = df.groupby('country')['v'].transform('sum')
+    product_tot = df.groupby('k')['v'].transform('sum')
+    total = df['v'].sum()
+
+    df['Mcp'] = (df['v'] / country_tot) / (product_tot / total)
     
 
-    return final_df
+    matrix = df.pivot_table(
+        index= 'country',
+        columns= 'k',
+        values='Mcp',
+        fill_value=0
+    ).astype(float)
+    return matrix
 
 
 
-def AIPNET_to_C(df, upstream_product_column_name, downstream_product_column_name, N):
+
+# 1.2) BACI ---> Mcp (intera cartella)
+
+def Mcp_from_BACI_pipeline(
+    BACI_folder: str,
+    Mcp_folder: str,
+) :
+    """
+    Converte tutti i file di una cartella in Mcp
+    
+    Input:
+    - BACI_folder: cartella con i file BACI
+    - Mcp_folder: cartella in cui salvare i file Mcp
+    
+    """
+    os.makedirs(Mcp_folder, exist_ok=True)
+
+    for filename in os.listdir(BACI_folder):
+        if not filename.endswith(".parquet"):
+            continue
+
+        in_path = os.path.join(BACI_folder, filename)
+        BACI_df = pd.read_parquet(in_path)
+
+        Mcp = build_Mcp_from_BACI(BACI_df)
+
+        # Sostituisco il prefisso BACI -> Mcp nel nome file
+        out_filename = "Mcp" + filename[len("BACI"):]
+        
+        out_path = os.path.join(Mcp_folder, out_filename)
+        Mcp.to_parquet(out_path, index=False)
+        
+
+
+
+
+# 2) AIPNET / C processing
+
+
+# 2.1) AIPNET to C adiancency matrix
+
+def AIPNET_to_C(AIPNET_df: pd.DataFrame, 
+                upstream_product_column_name: str, 
+                downstream_product_column_name: str, 
+                N) -> pd.DataFrame:
 
     """
     - Questa funzione mi permette di convertire i dati AIPNET in una matrice di composizione binaria C_pp' (p è input di p')
     - Da applicare a ciascuno dei 10 database AIPNET (4/6-digits x HS02/07/12/17/22)
      
     Input:
-    - M: pd.dataframe 
-      Dataframe con i dati AIPNET 
+    - AIPNET_df: Dataframe con i dati AIPNET 
     - upstream_product_column_name : nome della colonna coi prodotti upstream
     - downstream_product_column_name: nome della colonna coi prodotti downstream
-    - N: numero di cifre della classificazione HS che voglio
+    - N: numero di cifre della classificazione HS che voglio ---> mi serve per mantenere lo 0 davanti in caso di necessità
 
     Output:
     - C: matrice di composizione
@@ -97,7 +257,7 @@ def AIPNET_to_C(df, upstream_product_column_name, downstream_product_column_name
     """
     
     # creo una copia  
-    C = df.copy()
+    C = AIPNET_df.copy()
     
     # converto gli indici delle due colonne in stringhe a n cifre (nel caso fillo con lo 0 davanti)
     C[upstream_product_column_name] = C[upstream_product_column_name].astype(str).str.zfill(N)  
@@ -113,100 +273,64 @@ def AIPNET_to_C(df, upstream_product_column_name, downstream_product_column_name
     return C
 
 
-def BACI_HS6_to_HS4(df):
 
-    """
-    Input: 
-    - File BACI HS6 (formato parquet) aggregato avente colonne:
-    t: year
-    i/j: exporter/importer
-    k: product
-    v: value
 
-    Output: 
-    - File BACI HS4 (formato parquet) aggregato avente colonne:
-    t: year
-    i/j: exporter/importer
-    k: product
-    v: value
+
+
+#3) ALLINEAMENTO MATRICI C E Mcp per poter runnare gli algoritmi extended
     
+#3.1) Funzione per paragonare i codici prodotto di M e C (singoli file)
+
+def M_and_C_different_products(M: pd.DataFrame, C: pd.DataFrame,
+                             verbose: bool = True) -> dict:
     """
-
-    # prendo le prime 4 cifre dei codici nella colonna "k"
-    df['k'] = df['k'].str[:4]
-    # aggrego anche i dati di export/import
-    df = df.groupby(['j','t', 'k'])['v'].sum().reset_index()
-
-    return df
-
-
-def C_test(df):
-    
-    """
-    Verifica che la matrice C abbia correttamente gli stessi codici su righe e colonne
-    Se tutto è corretto dovrebbe dare 0
+    Questa funzione confronta i codici prodotto della matrice M e C
 
     Input:
-    - Matrice C
-
-    Output:
-    - Numero di codici diversi tra righe e colonne
+    - M, C          : le due matrici (DataFrame) che vado a comparare
+    - name_M, name_C: nomi descrittivi per la stampa
+    
+    Output :
+    - n_codes_A, n_codes_B, n_common: informazioni che possono servire
+    - only_M : codici presenti in M ma non in C
+    - only_C : codici presenti in C ma non in M
+    - common : codici in comune
     
     """
+    
+    # 1) CODICI PRODOTTO
+    M_codes =  set(pd.unique(M.columns.astype(str)))
+    C_codes =  set(pd.unique(C.columns.astype(str)))
 
-    # Codici diversi riga e colonna
-    C_codes_row = set(pd.unique(C.index.astype(str)))
-    C_codes_columns = set(pd.unique(C.columns.astype(str)))
-    missing_total =  C_codes_row ^ C_codes_columns
-
-    return missing_total
+    # 2) CONFRONTO CODICI PRODOTTO
+    common = M_codes & C_codes
+    only_M = M_codes - C_codes   
+    only_C = C_codes - M_codes
+     
 
     
-    
-def M_and_C_common_products(M, C):
-    """
-    Prima di runnare questa funzione è molto utile usare C_test per una prima verifica
-    
-    Input:
-    - matrice Cpp'
-    - matrice Mcp
-
-    Output:
-    - elementi diversi tra le due matrici
-    
-    """
-
-    # estrazione codici prodotto HS + visualizzazione numero di codici 
-    M_codes=set(pd.unique(M.columns.astype(str)))
-    print("Numero di colonne Mcp: ",len(M_codes))
-    C_codes = set(pd.unique(C.columns.astype(str)) )
-    print("Numero di righe Cpp': ",len( C_codes))
+    # INTERRUTTORE di stampa (opzionale)
+    if verbose:
+        print(f"  [Mcp  vs  C]")
+        print(f"     Codici in Mcp: {len(M_codes)}  |  Codici in C: {len(C_codes)}")
+        print(f"     In comune: {len(common)}")
+        print(f"     Solo in Mcp (mancanti in C): {len(only_M)} -> {sorted(only_M)}")
+        print(f"     Solo in C (mancanti in Mcp): {len(only_C)} -> {sorted(only_C)}")
 
     
-    common_products = C_codes & M_codes
-    print("prodotti in comune tra righe di Cpp e Mcp:",len(common_products))
+    return {
+        "numero_codici_M": len(M_codes),
+        "numero_codici_C": len(C_codes),
+        "numero_prodotti_comuni": len(common),
+        "prodotti_in_comune": common,
+        "only_M": only_M,
+        "only_C": only_C,
+        
+    }
     
-    C_missing =  M_codes - C_codes
-    print ("Prodotti presenti in M ma non in C:",C_missing)
-    print ("Numero di Prodotti presenti in M ma non in C:",len(C_missing))
-    M_missing = C_codes - M_codes
-    print ("Numero di Prodotti presenti in M ma non in C:",M_missing)
-    print ("Prodotti presenti in C ma non in M:",len(M_missing))
-    
+#3.2) Calcolo impatto economico codici che devo escludere da Mcp
 
-    return C_missing, M_missing
-
-def count_number_of_0s_and_1s(C):
-    
-    C = np.array(C)
-
-    count_0s = np.sum(C == 0)
-    count_1s = np.sum(C == 1)
-
-    return count_0s, count_1s
-    
-
-def missing_codes_economic_impact(missing, BACI_df ):
+def missing_in_C_codes_economic_impact(missing, BACI_df ):
     """
     Input:
     - missing: lista di codici presenti in BACI ma non in AIPNET
@@ -238,31 +362,187 @@ def missing_codes_economic_impact(missing, BACI_df ):
 
 
 
-def autovettore_principale(df):
+
+def pipeline (M: pd.DataFrame, C: pd.DataFrame, BACI: pd.DataFrame)-> pd.DataFrame :
     """
-    Calcola l'autovettore principale (associato al       massimo autovalore in modulo)
+    Questa funzione crea la matrice Mcp allineata con C per il singolo anno.
 
     Input:
-    - df: pd.DataFrame (matrice quadrata)
-
-    Output:
-    - pd.Series (autovettore principale normalizzato)
+    - M, C: 
+    - BACI: 
+    
+    Output :
+    - Mcp_alligned: matrice Mcp su cui posso runnare gli algoritmi extended
+    
     """
     
-    A = df.values  # converto in numpy
+
+    # 1) PRODOTTI DIVERSI TRA C e M
+    results = M_and_C_different_products(M, C, verbose = True) 
+    # 1.a) Prodotti solo in M ---> sono quelli che dovrò eliminare e di cui calcolo l'impatto economico
+    only_M = results["only_M"]
+    # 1.b) Prodotti su calcolo Mcp (i prodotti in comune tra C  e Mcp) 
+    M_and_C_common_codes = results["prodotti_in_comune"]
+
+    # 2) IMPATTO ECONOMICO CODICI CHE DEVO SCARTARE
+    missing_in_C_codes_economic_impact(only_M, BACI)
     
-    # autovalori e autovettori
-    eigvals, eigvecs = np.linalg.eig(A)
+    # 3) MATRICE Mcp ALLINEATA 
     
-    # indice autovalore dominante (modulo massimo)
-    idx = np.argmax(np.abs(eigvals))
+    # 3.1) costruisco Mcp a partire da BACI con i codici in comune
+    BACI_alligned = BACI[BACI["k"].isin(M_and_C_common_codes)]
+    Mcp = build_Mcp_from_BACI(BACI_alligned)   # !!!!!
+
+    # 3.2) Aggiungo le colonne (di 0) con i only_C per completare l'allineamento
+    only_C = results["only_C"]
+    all_cols = list(Mcp.columns) + [p for p in only_C ]
+    Mcp_alligned = Mcp.reindex(columns= C.columns, fill_value=0)
     
-    # autovettore corrispondente
-    v = eigvecs[:, idx]
+    return Mcp_alligned
+
+
+
+
+def pipeline_completa(
+    M: pd.DataFrame,
+    C: pd.DataFrame,
+    BACI: pd.DataFrame,
+    binarized: bool = True
+) -> pd.DataFrame:
+    """
+    Questa funzione crea la matrice Mcp allineata con C per il singolo anno.
     
-    # normalizzazione (opzionale ma utile)
-    v = np.real(v)  # evita complessi numerici
-    v = v / np.linalg.norm(v)
+    Input:
+    - M, C, BACI: matrici di input
+    - binarized: se True usa build_Mcp_from_BACI (versione binarizzata),
+                 se False usa build_Mcp_non_binarized_from_BACI (versione non binarizzata)
     
-    # ritorno come Series con stessi indici
-    return pd.Series(v, index=df.index)
+    Output:
+    - Mcp_alligned: matrice Mcp su cui posso runnare gli algoritmi extended
+    """
+    
+    # 1) PRODOTTI DIVERSI TRA C e M
+    results = M_and_C_different_products(M, C, verbose=True)
+    # 1.a) Prodotti solo in M ---> sono quelli che dovrò eliminare e di cui calcolo l'impatto economico
+    only_M = results["only_M"]
+    # 1.b) Prodotti su calcolo Mcp (i prodotti in comune tra C e Mcp)
+    M_and_C_common_codes = results["prodotti_in_comune"]
+    
+    # 2) IMPATTO ECONOMICO CODICI CHE DEVO SCARTARE
+    missing_in_C_codes_economic_impact(only_M, BACI)
+    
+    # 3) MATRICE Mcp ALLINEATA
+    
+    # 3.1) costruisco Mcp a partire da BACI con i codici in comune
+    BACI_alligned = BACI[BACI["k"].isin(M_and_C_common_codes)]
+    
+    if binarized:
+        Mcp = build_Mcp_from_BACI(BACI_alligned)
+    else:
+        Mcp = build_Mcp_non_binarized_from_BACI(BACI_alligned)
+    
+    # 3.2) Aggiungo le colonne (di 0) con i only_C per completare l'allineamento
+    only_C = results["only_C"]
+    all_cols = list(Mcp.columns) + [p for p in only_C ]
+    Mcp_alligned = Mcp.reindex(columns=C.columns, fill_value=0)
+    
+    return Mcp_alligned
+
+
+
+
+
+def run_pipeline_all_years(
+    M_folder: Path,
+    BACI_folder: Path,
+    C: pd.DataFrame
+) -> dict:
+    """
+    Esegue pipeline() per ogni anno disponibile.
+    Input:
+    - M_folder, BACI_folder: cartelle con le matrici
+    - C: dataframe con la matrice C (unica)
+    
+    Output :
+    - Salva la matrice Mcp_alligned per ogni anno in una cartella
+
+    NOTA BENE:
+    A seconda del caso vanno modificate le seguenti parti:
+    - BACI_path
+    - salvataggio
+    
+    """
+    results = {}
+
+
+    # Cerco dentro la cartella Mcp tutti i file che finiscono in .parquet e uso sorted per ordinarli (comodo)
+    for M_path in sorted(M_folder.glob("*.parquet")):
+
+        # Cerco i 4 numeri dopo Y 
+        match = re.search(r"Y(\d{4})", M_path.name)
+        
+        # group (0) mi darebbe anche la Y
+        year = int(match.group(1))
+        
+        BACI_path = BACI_folder / f"BACI_export_HS02_Y{year}.parquet"
+
+        M = pd.read_parquet(M_path)
+        BACI = pd.read_parquet(BACI_path)
+
+        Mcp = pipeline(M, C, BACI)
+        
+        # salvataggio (opzionale)
+        Mcp.to_parquet(rf'C:\Users\vitto\Desktop\CSH RESEARCH\data\HS02_all_years\6_digits\Mcp_export_non_binarized_alligned\Mcp_export_alligned_Y{year}.parquet')
+
+
+    return Mcp
+
+def run_pipeline_all_years_completa(
+    M_folder: Path,
+    BACI_folder: Path,
+    C: pd.DataFrame,
+    output_folder: Path,
+    trade_type: str = "export",
+    binarized: bool = True
+) -> dict:
+    """
+    Esegue pipeline() per ogni anno disponibile.
+    
+    Input:
+    - M_folder, BACI_folder: cartelle con le matrici
+    - C: dataframe con la matrice C (unica)
+    - output_folder: cartella dove salvare i file di output
+    - trade_type: "export" o "import"
+    
+    Output:
+    - Salva la matrice Mcp_alligned per ogni anno nella cartella specificata
+    - Ritorna un dizionario {anno: Mcp}
+    """
+    
+    output_folder = Path(output_folder)
+    output_folder.mkdir(parents=True, exist_ok=True)
+    
+    results = {}
+    
+    # Cerco dentro la cartella M tutti i file che finiscono in .parquet e li ordino
+    for M_path in sorted(M_folder.glob("*.parquet")):
+        # Cerco i 4 numeri dopo Y
+        match = re.search(r"Y(\d{4})", M_path.name)
+        
+        year = int(match.group(1))
+        
+        BACI_path = BACI_folder / f"BACI_{trade_type}_HS02_Y{year}.parquet"
+        
+        M = pd.read_parquet(M_path)
+        BACI = pd.read_parquet(BACI_path)
+        
+        Mcp = pipeline_completa(M, C, BACI, binarized = binarized)
+        
+        # salvataggio
+        save_path = output_folder / f"Mcp_{trade_type}_alligned_Y{year}.parquet"
+        Mcp.to_parquet(save_path)
+        
+        results[year] = Mcp
+    
+    return results
+   

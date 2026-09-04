@@ -1,10 +1,21 @@
 __pycache__/
 *.pyc
+
 .ipynb_checkpoints/
 
-.env
-.venv
-env/
 
-.idea/
-.vscode/
+*.pdf
+*.pptx
+
+data/
+experiments/
+papers/
+results/
+theory/
+varie/
+
+
+
+
+
+

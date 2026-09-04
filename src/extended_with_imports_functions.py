@@ -5,6 +5,25 @@ import numpy as np
 
 # In[ ]:
 
+def compute_X(C, M_export):
+    """
+    X_cp = (C @ M_export)_cp
+    Questa matrice mi dice a quanti output p' esportati dal paese c serve ogni prodotto p
+    
+    """
+    return C @ M_export
+
+
+def compute_N(X, M_import):
+
+    """
+    Questa matrice con element-wise product mi permette di selezionare solo i prodotti importati 
+    
+    """
+   
+    return X * M_import
+
+
 
 def phi_1(M: np.ndarray, Q: np.ndarray) -> np.ndarray:
     """
@@ -59,6 +78,8 @@ def matrix_power_series(C: np.ndarray, max_power: int):
         S += current_power
 
     return S
+
+
 def build_C_tensor(C, M):
     P = C.shape[0]
     C_tensor = np.zeros((P, P, M))
