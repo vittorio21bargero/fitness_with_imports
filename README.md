@@ -46,6 +46,5 @@ Actively under development. The organization of the accessory modules in `src/` 
 ## Author
 Vittorio Bargero
 
-## Autore
 
 [Il tuo nome]
